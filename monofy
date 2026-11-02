@@ -1,26 +1,33 @@
 #!/usr/bin/env bash
-# monofy — take an audio file where only one channel has sound, keep the loudest
-# channel, make it mono, loudness-normalise it, and export WAV (DaVinci) / MP3.
+# monofy — take an audio file where only one channel has sound, copy that channel
+# to both sides as stereo, trim leading/trailing silence, loudness-normalise it,
+# and export WAV (DaVinci) / MP3.
 #
-# usage: monofy [-m] [-b] [-l LUFS] [-c N] file.m4a [more files...]
+# usage: monofy [-m] [-b] [-k] [-t dB] [-l LUFS] [-c N] file.m4a [more files...]
 #   -m        MP3 only
 #   -b        both WAV and MP3
+#   -k        keep silence (don't trim start/end)
+#   -t dB     silence threshold for trimming (default -50)
 #   -l LUFS   target loudness (default -16; use -23 for broadcast, -14 for YouTube-loud)
 #   -c N      force channel N (1-based) instead of auto-detecting the loudest
 set -euo pipefail
 
-target=-16 wav=1 mp3=0 force_ch=""
-while getopts "mbl:c:h" opt; do
+usage() { sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; }
+
+target=-16 wav=1 mp3=0 force_ch="" trim=1 thresh=-50
+while getopts "mbkt:l:c:h" opt; do
   case $opt in
     m) wav=0 mp3=1 ;;
     b) wav=1 mp3=1 ;;
+    k) trim=0 ;;
+    t) thresh=$OPTARG ;;
     l) target=$OPTARG ;;
     c) force_ch=$OPTARG ;;
-    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) usage; exit 0 ;;
   esac
 done
 shift $((OPTIND - 1))
-[[ $# -eq 0 ]] && { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+[[ $# -eq 0 ]] && { usage; exit 1; }
 
 for in in "$@"; do
   [[ -f $in ]] || { echo "skip: $in not found" >&2; continue; }
@@ -35,9 +42,16 @@ for in in "$@"; do
         awk '/RMS level dB/ { v=$NF; if (v=="-inf") v=-999; if (best=="" || v>best) { best=v; idx=n } n++ }
              END { print idx+0 }')
   fi
-  echo "→ $in: using channel $((ch + 1)), target ${target} LUFS"
+  echo "→ $in: using channel $((ch + 1)), target ${target} LUFS$( ((trim)) && echo ", trimming silence below ${thresh} dB")"
 
-  pre="pan=mono|c0=c${ch}"
+  # same channel on both sides
+  pre="pan=stereo|c0=c${ch}|c1=c${ch}"
+  if (( trim )); then
+    # trim the start, then reverse and trim again for the end; keep 0.1s of padding each side
+    sr="silenceremove=start_periods=1:start_threshold=${thresh}dB:start_silence=0.1"
+    pre="${pre},${sr},areverse,${sr},areverse"
+  fi
+
   # pass 1: measure loudness so pass 2 can normalise accurately
   stats=$(ffmpeg -hide_banner -nostats -i "$in" -map 0:a:0 \
            -af "${pre},loudnorm=I=${target}:TP=-1.5:LRA=11:print_format=json" -f null - 2>&1 |
@@ -47,12 +61,12 @@ for in in "$@"; do
 
   if (( wav )); then
     ffmpeg -hide_banner -loglevel error -y -i "$in" -map 0:a:0 -af "${pre},${norm}" \
-      -ar 48000 -c:a pcm_s24le "${base}_mono.wav"
-    echo "  ✓ ${base}_mono.wav"
+      -ar 48000 -c:a pcm_s24le "${base}_stereo.wav"
+    echo "  ✓ ${base}_stereo.wav"
   fi
   if (( mp3 )); then
     ffmpeg -hide_banner -loglevel error -y -i "$in" -map 0:a:0 -af "${pre},${norm}" \
-      -ar 48000 -c:a libmp3lame -b:a 320k "${base}_mono.mp3"
-    echo "  ✓ ${base}_mono.mp3"
+      -ar 48000 -c:a libmp3lame -b:a 320k "${base}_stereo.mp3"
+    echo "  ✓ ${base}_stereo.mp3"
   fi
 done
