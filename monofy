@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# monofy — take an audio file where only one channel has sound, keep the loudest
+# channel, make it mono, loudness-normalise it, and export WAV (DaVinci) / MP3.
+#
+# usage: monofy [-m] [-b] [-l LUFS] [-c N] file.m4a [more files...]
+#   -m        MP3 only
+#   -b        both WAV and MP3
+#   -l LUFS   target loudness (default -16; use -23 for broadcast, -14 for YouTube-loud)
+#   -c N      force channel N (1-based) instead of auto-detecting the loudest
+set -euo pipefail
+
+target=-16 wav=1 mp3=0 force_ch=""
+while getopts "mbl:c:h" opt; do
+  case $opt in
+    m) wav=0 mp3=1 ;;
+    b) wav=1 mp3=1 ;;
+    l) target=$OPTARG ;;
+    c) force_ch=$OPTARG ;;
+    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  esac
+done
+shift $((OPTIND - 1))
+[[ $# -eq 0 ]] && { sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
+
+for in in "$@"; do
+  [[ -f $in ]] || { echo "skip: $in not found" >&2; continue; }
+  base="${in%.*}"
+
+  # pick the channel with the highest RMS (0-based for ffmpeg's pan filter)
+  if [[ -n $force_ch ]]; then
+    ch=$((force_ch - 1))
+  else
+    ch=$(ffmpeg -hide_banner -nostats -i "$in" -map 0:a:0 \
+          -af "astats=measure_overall=none:measure_perchannel=RMS_level" -f null - 2>&1 |
+        awk '/RMS level dB/ { v=$NF; if (v=="-inf") v=-999; if (best=="" || v>best) { best=v; idx=n } n++ }
+             END { print idx+0 }')
+  fi
+  echo "→ $in: using channel $((ch + 1)), target ${target} LUFS"
+
+  pre="pan=mono|c0=c${ch}"
+  # pass 1: measure loudness so pass 2 can normalise accurately
+  stats=$(ffmpeg -hide_banner -nostats -i "$in" -map 0:a:0 \
+           -af "${pre},loudnorm=I=${target}:TP=-1.5:LRA=11:print_format=json" -f null - 2>&1 |
+         sed -n '/^{/,/^}/p')
+  get() { echo "$stats" | awk -F'"' -v k="$1" '$2==k { print $4 }'; }
+  norm="loudnorm=I=${target}:TP=-1.5:LRA=11:measured_I=$(get input_i):measured_TP=$(get input_tp):measured_LRA=$(get input_lra):measured_thresh=$(get input_thresh):offset=$(get target_offset):linear=true"
+
+  if (( wav )); then
+    ffmpeg -hide_banner -loglevel error -y -i "$in" -map 0:a:0 -af "${pre},${norm}" \
+      -ar 48000 -c:a pcm_s24le "${base}_mono.wav"
+    echo "  ✓ ${base}_mono.wav"
+  fi
+  if (( mp3 )); then
+    ffmpeg -hide_banner -loglevel error -y -i "$in" -map 0:a:0 -af "${pre},${norm}" \
+      -ar 48000 -c:a libmp3lame -b:a 320k "${base}_mono.mp3"
+    echo "  ✓ ${base}_mono.mp3"
+  fi
+done
